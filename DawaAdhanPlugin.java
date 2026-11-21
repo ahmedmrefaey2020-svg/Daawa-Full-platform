@@ -1,0 +1,406 @@
+package com.dawa.app; // <-- غيّره لـ appId بتاعك
+
+import android.Manifest;
+import android.app.Activity;
+import android.app.AlarmManager;
+import android.content.Context;
+import android.content.Intent;
+import android.net.Uri;
+import android.os.Build;
+import android.os.PowerManager;
+import android.provider.Settings;
+
+import androidx.core.app.NotificationManagerCompat;
+
+import com.getcapacitor.JSArray;
+import com.getcapacitor.JSObject;
+import com.getcapacitor.Plugin;
+import com.getcapacitor.PluginCall;
+import com.getcapacitor.PermissionState;
+import com.getcapacitor.PluginMethod;
+import com.getcapacitor.annotation.CapacitorPlugin;
+import com.getcapacitor.annotation.Permission;
+import com.getcapacitor.annotation.PermissionCallback;
+
+import org.json.JSONArray;
+
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+
+/** جسر JS <-> أندرويد: تحميل ملف المؤذن، جدولة الأذان، وطلب أذونات الخلفية. */
+@CapacitorPlugin(name = "DawaAdhan", permissions = { @Permission(alias = "loc", strings = { Manifest.permission.ACCESS_COARSE_LOCATION }) })
+public class DawaAdhanPlugin extends Plugin {
+
+    static File adhanDir(Context c) {
+        File d = new File(c.getFilesDir(), "adhan"); // المسار: /data/data/<appId>/files/adhan/
+        if (!d.exists()) d.mkdirs();
+        return d;
+    }
+
+    /** مجلد التلاوات المحمّلة: files/dl/ */
+    static File dirFor(Context c, String dir) {
+        if (dir == null || dir.isEmpty() || dir.equals("adhan")) return adhanDir(c);
+        File d = new File(c.getFilesDir(), dir.replaceAll("[^A-Za-z0-9_-]", "_"));
+        if (!d.exists()) d.mkdirs();
+        return d;
+    }
+
+    private static String safeName(String id) {
+        return id.replaceAll("[^A-Za-z0-9_.-]", "_") + ".mp3";
+    }
+
+    /** download({url,id}) -> {name,size}  بيحفظ في files/adhan/<id>.mp3 */
+    @PluginMethod
+    public void download(final PluginCall call) {
+        final String url = call.getString("url");
+        final String id = call.getString("id");
+        final String dirName = call.getString("dir", "adhan");
+        final String metaStr = call.getString("meta", "");
+        final String pubName = call.getString("pub", "");
+        Integer mm = call.getInt("maxMb", 25);
+        final long maxBytes = (mm == null ? 25 : mm) * 1024L * 1024L;
+        if (url == null || id == null || !url.startsWith("https://")) {
+            call.reject("bad args");
+            return;
+        }
+        final Context ctx = getContext();
+        new Thread(() -> {
+            File part = null;
+            try {
+                String cur = url;
+                HttpURLConnection c = null;
+                boolean ok = false;
+                for (int i = 0; i < 6 && !ok; i++) {
+                    c = (HttpURLConnection) new URL(cur).openConnection();
+                    c.setInstanceFollowRedirects(false);
+                    c.setConnectTimeout(15000);
+                    c.setReadTimeout(30000);
+                    c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36");
+                    c.setRequestProperty("Accept", "audio/mpeg,audio/*;q=0.9,*/*;q=0.8");
+                    int code = c.getResponseCode();
+                    if (code >= 300 && code < 400) {
+                        String loc = c.getHeaderField("Location");
+                        c.disconnect();
+                        if (loc == null) throw new Exception("redirect");
+                        cur = new URL(new URL(cur), loc).toString();
+                        if (!cur.startsWith("https://")) throw new Exception("insecure redirect");
+                    } else if (code == 200) {
+                        ok = true;
+                    } else {
+                        throw new Exception("HTTP " + code);
+                    }
+                }
+                if (!ok) throw new Exception("too many redirects");
+                String name = safeName(id);
+                File dir = dirFor(ctx, dirName);
+                part = new File(dir, name + ".part");
+                long total = 0;
+                try (InputStream in = c.getInputStream(); FileOutputStream out = new FileOutputStream(part)) {
+                    byte[] buf = new byte[16384];
+                    int n;
+                    while ((n = in.read(buf)) > 0) {
+                        total += n;
+                        if (total > maxBytes) throw new Exception("too big");
+                        out.write(buf, 0, n);
+                    }
+                }
+                c.disconnect();
+                if (total < 5000) throw new Exception("empty file");
+                File dst = new File(dir, name);
+                if (dst.exists()) dst.delete();
+                if (!part.renameTo(dst)) throw new Exception("rename failed");
+                // ملف جانبي (.meta) فيه رابط التلاوة واسم القارئ: بيخلّي التطبيق يسترجع قائمة التحميلات من الملفات نفسها لو اتمسحت قاعدة البيانات
+                if (metaStr != null && !metaStr.isEmpty()) {
+                    try (FileOutputStream mo = new FileOutputStream(new File(dir, name + ".meta"))) {
+                        mo.write(metaStr.getBytes("UTF-8"));
+                    } catch (Exception ignore) { }
+                }
+                if (pubName != null && !pubName.isEmpty()) exportPublic(ctx, dst, pubName);
+                JSObject r = new JSObject();
+                r.put("name", name);
+                r.put("size", total);
+                r.put("path", dst.getAbsolutePath());
+                call.resolve(r);
+            } catch (Exception e) {
+                if (part != null) part.delete();
+                call.reject(String.valueOf(e.getMessage()));
+            }
+        }).start();
+    }
+
+    @PluginMethod
+    public void remove(PluginCall call) {
+        String name = call.getString("name", "");
+        if (!name.isEmpty() && name.indexOf('/') < 0 && name.indexOf("..") < 0) {
+            File dd = dirFor(getContext(), call.getString("dir", "adhan"));
+            new File(dd, name).delete();
+            new File(dd, name + ".meta").delete();
+        }
+        String pub = call.getString("pub", "");
+        if (pub != null && !pub.isEmpty()) unexport(getContext(), pubSafe(pub, true));
+        call.resolve();
+    }
+
+    static String pubSafe(String pub, boolean audio) {
+        String nm = pub == null ? "" : pub.replaceAll("[\\\\/:*?\"<>|]", "_").trim();
+        if (nm.isEmpty()) return "";
+        if (audio) { if (!nm.toLowerCase().endsWith(".mp3")) nm += ".mp3"; }
+        else if (nm.indexOf('.') < 0) nm += ".json";
+        return nm;
+    }
+
+    /** نسخة قابلة للوصول من مجلد Downloads/Dawa (MediaStore على أندرويد 10+) */
+    private static void exportPublic(Context c, File src, String pub) {
+        try (FileInputStream in = new FileInputStream(src)) {
+            exportStream(c, in, pubSafe(pub, true), "audio/mpeg");
+        } catch (Exception ignore) { }
+    }
+
+    private static void exportStream(Context c, InputStream in, String nm, String mime) {
+        try {
+            if (nm == null || nm.isEmpty()) return;
+            if (Build.VERSION.SDK_INT >= 29) {
+                android.content.ContentResolver cr = c.getContentResolver();
+                android.net.Uri col = android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI;
+                String sel = android.provider.MediaStore.MediaColumns.DISPLAY_NAME + "=? AND " + android.provider.MediaStore.MediaColumns.RELATIVE_PATH + " LIKE ?";
+                String[] args = new String[]{nm, "Download/Dawa%"};
+                cr.delete(col, sel, args);
+                android.content.ContentValues v = new android.content.ContentValues();
+                v.put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, nm);
+                v.put(android.provider.MediaStore.MediaColumns.MIME_TYPE, mime);
+                v.put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, "Download/Dawa");
+                v.put(android.provider.MediaStore.MediaColumns.IS_PENDING, 1);
+                android.net.Uri u = cr.insert(col, v);
+                if (u == null) return;
+                try (java.io.OutputStream o = cr.openOutputStream(u)) {
+                    byte[] buf = new byte[16384];
+                    int k;
+                    while ((k = in.read(buf)) > 0) o.write(buf, 0, k);
+                }
+                v.clear();
+                v.put(android.provider.MediaStore.MediaColumns.IS_PENDING, 0);
+                cr.update(u, v, null, null);
+            } else {
+                File d = new File(android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS), "Dawa");
+                if (!d.exists()) d.mkdirs();
+                File t = new File(d, nm);
+                try (FileOutputStream o = new FileOutputStream(t)) {
+                    byte[] buf = new byte[16384];
+                    int k;
+                    while ((k = in.read(buf)) > 0) o.write(buf, 0, k);
+                }
+            }
+        } catch (Exception ignore) { }
+    }
+
+    /** بيمسح النسخة من Downloads/Dawa لما التلاوة أو الملف يتمسح من التطبيق */
+    private static void unexport(Context c, String nm) {
+        try {
+            if (nm == null || nm.isEmpty()) return;
+            if (Build.VERSION.SDK_INT >= 29) {
+                c.getContentResolver().delete(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                        android.provider.MediaStore.MediaColumns.DISPLAY_NAME + "=? AND " + android.provider.MediaStore.MediaColumns.RELATIVE_PATH + " LIKE ?",
+                        new String[]{nm, "Download/Dawa%"});
+            } else {
+                new File(new File(android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS), "Dawa"), nm).delete();
+            }
+        } catch (Exception ignore) { }
+    }
+
+    /** saveText({name,text}) — نسخة من المصحف/الأحاديث/المتون في Downloads/Dawa */
+    @PluginMethod
+    public void saveText(final PluginCall call) {
+        final String name = pubSafe(call.getString("name", ""), false);
+        final String text = call.getString("text", "");
+        if (name.isEmpty() || text == null || text.isEmpty()) { call.reject("bad args"); return; }
+        final Context ctx = getContext();
+        new Thread(() -> {
+            try {
+                exportStream(ctx, new java.io.ByteArrayInputStream(text.getBytes("UTF-8")), name, "application/json");
+                call.resolve();
+            } catch (Exception e) {
+                call.reject(String.valueOf(e.getMessage()));
+            }
+        }).start();
+    }
+
+    @PluginMethod
+    public void removePub(PluginCall call) {
+        boolean audio = call.getBoolean("audio", false) == Boolean.TRUE;
+        unexport(getContext(), pubSafe(call.getString("name", ""), audio));
+        call.resolve();
+    }
+
+    /** طلب إذن الموقع (تقريبي يكفي لمواقيت الصلاة) مباشرة من الجهة الأصلية */
+    @PluginMethod
+    public void requestLocation(PluginCall call) {
+        if (getPermissionState("loc") == PermissionState.GRANTED) {
+            JSObject r = new JSObject();
+            r.put("ok", true);
+            call.resolve(r);
+            return;
+        }
+        requestPermissionForAlias("loc", call, "locCb");
+    }
+
+    @PermissionCallback
+    private void locCb(PluginCall call) {
+        JSObject r = new JSObject();
+        r.put("ok", getPermissionState("loc") == PermissionState.GRANTED);
+        call.resolve(r);
+    }
+
+    /** list({dir}) -> {files:[{name,size,path,meta}]} — الملفات المحمّلة فعليًا على الجهاز */
+    @PluginMethod
+    public void list(PluginCall call) {
+        try {
+            File dir = dirFor(getContext(), call.getString("dir", "dl"));
+            JSArray arr = new JSArray();
+            File[] fs = dir.listFiles();
+            if (fs != null) {
+                for (File f : fs) {
+                    String n = f.getName();
+                    if (!n.endsWith(".mp3") || f.length() < 5000) continue;
+                    JSObject o = new JSObject();
+                    o.put("name", n);
+                    o.put("size", f.length());
+                    o.put("path", f.getAbsolutePath());
+                    File m = new File(dir, n + ".meta");
+                    if (m.exists() && m.length() < 8192) {
+                        try (FileInputStream in = new FileInputStream(m); ByteArrayOutputStream bo = new ByteArrayOutputStream()) {
+                            byte[] buf = new byte[1024];
+                            int k;
+                            while ((k = in.read(buf)) > 0) bo.write(buf, 0, k);
+                            o.put("meta", bo.toString("UTF-8"));
+                        } catch (Exception ignore) { }
+                    }
+                    arr.put(o);
+                }
+            }
+            JSObject r = new JSObject();
+            r.put("files", arr);
+            call.resolve(r);
+        } catch (Exception e) {
+            call.reject(String.valueOf(e.getMessage()));
+        }
+    }
+
+    /** schedule({items:[{id,at,title,body}], file, volume}) */
+    @PluginMethod
+    public void schedule(PluginCall call) {
+        JSArray items = call.getArray("items");
+        if (items == null) {
+            call.reject("no items");
+            return;
+        }
+        Double vol = call.getDouble("volume", 0.9);
+        AdhanScheduler.save(getContext(), (JSONArray) items, call.getString("file", ""), vol == null ? 0.9 : vol);
+        AdhanScheduler.armNext(getContext());
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void cancelAll(PluginCall call) {
+        AdhanScheduler.clear(getContext());
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void stop(PluginCall call) {
+        AdhanService.stop(getContext());
+        call.resolve();
+    }
+
+    /** test({file,volume,seconds,title,body}) — بيشتغل حتى لو قفلت التطبيق */
+    @PluginMethod
+    public void test(PluginCall call) {
+        Double vol = call.getDouble("volume", 0.9);
+        Integer sec = call.getInt("seconds", 10);
+        AdhanScheduler.armTest(getContext(), (sec == null ? 10 : sec) * 1000L, call.getString("file", ""),
+                vol == null ? 0.9f : vol.floatValue(), call.getString("title", "الأذان"), call.getString("body", ""));
+        call.resolve();
+    }
+
+    private boolean canExact(Context c) {
+        if (Build.VERSION.SDK_INT < 31) return true;
+        AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
+        return am.canScheduleExactAlarms();
+    }
+
+    private boolean ignoringBattery(Context c) {
+        if (Build.VERSION.SDK_INT < 23) return true;
+        PowerManager pm = (PowerManager) c.getSystemService(Context.POWER_SERVICE);
+        return pm.isIgnoringBatteryOptimizations(c.getPackageName());
+    }
+
+    /** بيفتح إعدادات النظام لو لسه ناقص: المنبّه الدقيق أولًا، ثم استثناء البطارية. بيتنادى تاني لحد ما الاتنين يتفعّلوا. */
+    @PluginMethod
+    public void requestBackground(PluginCall call) {
+        Context c = getContext();
+        boolean exact = canExact(c), batt = ignoringBattery(c);
+        Activity a = getActivity();
+        try {
+            Uri pkg = Uri.parse("package:" + c.getPackageName());
+            if (!exact && Build.VERSION.SDK_INT >= 31) {
+                a.startActivity(new Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, pkg));
+            } else if (!batt && Build.VERSION.SDK_INT >= 23) {
+                a.startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, pkg));
+            }
+        } catch (Exception ignored) {
+        }
+        JSObject r = new JSObject();
+        r.put("exact", exact);
+        r.put("battery", batt);
+        r.put("ok", exact && batt);
+        call.resolve(r);
+    }
+
+    /** يفتح صفحة إعدادات التطبيق في النظام (لو المستخدم رفض إذنًا قبل كده ومبقاش النظام يسأله تاني). */
+    @PluginMethod
+    public void openAppSettings(PluginCall call) {
+        try {
+            Intent i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getContext().getPackageName()));
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            getContext().startActivity(i);
+        } catch (Exception ignored) {
+        }
+        call.resolve();
+    }
+
+    /** يفتح رابط (يوتيوب وغيره) خارج التطبيق — لو تطبيق يوتيوب متثبت بيفتح فيه. */
+    @PluginMethod
+    public void openUrl(PluginCall call) {
+        String u = call.getString("url", "");
+        if (!(u.startsWith("https://") || u.startsWith("http://"))) {
+            call.reject("bad url");
+            return;
+        }
+        try {
+            Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(u));
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            getContext().startActivity(i);
+            call.resolve();
+        } catch (Exception e) {
+            call.reject(String.valueOf(e.getMessage()));
+        }
+    }
+
+    @PluginMethod
+    public void status(PluginCall call) {
+        Context c = getContext();
+        JSObject r = new JSObject();
+        r.put("exact", canExact(c));
+        r.put("battery", ignoringBattery(c));
+        r.put("notifications", NotificationManagerCompat.from(c).areNotificationsEnabled());
+        JSArray files = new JSArray();
+        File[] fs = adhanDir(c).listFiles();
+        if (fs != null) for (File f : fs) if (f.getName().endsWith(".mp3")) files.put(f.getName());
+        r.put("files", files);
+        call.resolve(r);
+    }
+}
